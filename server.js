@@ -204,15 +204,9 @@ app.get('/tts/voices', (req, res) => {
   });
 });
 
-// Simular descarga de audio
-app.get('/download/:audioId', (req, res) => {
-  const { audioId } = req.params;
-  
-  res.json({
-    message: 'En producción, aquí se descargaría el archivo de audio',
-    audio_id: audioId,
-    note: 'Esta es una simulación. El archivo real se generaría con el servicio TTS real.'
-  });
+// Esto es lo que necesitamos (audio real)
+app.get('/download/:audio_id', (req, res) => {
+  // Generar audio real aquí
 });
 
 // Middleware de manejo de errores
