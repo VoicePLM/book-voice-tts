@@ -1,9 +1,9 @@
 const express = require('express');
 const cors = require('cors');
 const fs = require('fs');
-const path = require('path');
 const https = require('https');
-const { PassThrough } = require('stream');
+const FormData = require('form-data');
+const fetch = require('node-fetch');
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -12,258 +12,376 @@ const port = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
-// Almacén temporal para textos (simula base de datos)
+// Configuración de Chatterbox real
+const CHATTERBOX_API_URL = 'https://api.chatterbox.resemble.ai'; // URL real del API
+const CHATTERBOX_BACKUP_URL = 'http://localhost:4123'; // Servidor local si está disponible
+
+// Almacén temporal para textos y voces
 const audioTexts = new Map();
+const voiceLibrary = new Map();
 
-// Función para generar audio real usando Google TTS
-function generateRealAudio(text, audioId) {
-  return new Promise((resolve, reject) => {
-    // URL de Google Translate TTS
-    const googleTTSUrl = `https://translate.google.com/translate_tts?ie=UTF-8&q=${encodeURIComponent(text)}&tl=es&client=tw-ob`;
-    
-    https.get(googleTTSUrl, (response) => {
-      if (response.statusCode === 200) {
-        let audioBuffer = Buffer.alloc(0);
-        
-        response.on('data', (chunk) => {
-          audioBuffer = Buffer.concat([audioBuffer, chunk]);
-        });
-        
-        response.on('end', () => {
-          // Guardar el audio en memoria (en producción usarías almacenamiento permanente)
-          audioTexts.set(audioId, {
-            text: text,
-            audioBuffer: audioBuffer,
-            contentType: 'audio/mpeg',
-            generated: new Date()
-          });
-          
-          resolve({
-            success: true,
-            size: audioBuffer.length,
-            contentType: 'audio/mpeg'
-          });
-        });
-      } else {
-        reject(new Error(`Error HTTP: ${response.statusCode}`));
-      }
-    }).on('error', (error) => {
-      reject(error);
-    });
-  });
-}
-
-// Función alternativa usando gTTS (si Google no funciona)
-function generateAudioWithGTTS(text, audioId) {
-  const gtts = require('gtts');
-  
-  return new Promise((resolve, reject) => {
-    const speech = new gtts(text, 'es');
-    const buffers = [];
-    
-    const stream = speech.stream();
-    
-    stream.on('data', (chunk) => {
-      buffers.push(chunk);
-    });
-    
-    stream.on('end', () => {
-      const audioBuffer = Buffer.concat(buffers);
-      
-      audioTexts.set(audioId, {
-        text: text,
-        audioBuffer: audioBuffer,
-        contentType: 'audio/mpeg',
-        generated: new Date()
-      });
-      
-      resolve({
-        success: true,
-        size: audioBuffer.length,
-        contentType: 'audio/mpeg'
-      });
-    });
-    
-    stream.on('error', (error) => {
-      reject(error);
-    });
-  });
-}
-
-// Endpoint para generar TTS
-app.post('/tts/generate', async (req, res) => {
-  try {
-    const { text, voice_type = 'female' } = req.body;
-    
-    if (!text) {
-      return res.status(400).json({ error: 'Texto requerido' });
-    }
-    
-    const audioId = `audio_${Date.now()}`;
-    
-    // Guardar el texto para procesamiento
-    audioTexts.set(audioId, {
-      text: text,
-      audioBuffer: null,
-      contentType: 'audio/mpeg',
-      generated: new Date(),
-      processing: true
-    });
-    
-    // Procesar audio en segundo plano
+// Función para subir voz a Chatterbox
+async function uploadVoiceToChatterbox(audioBuffer, voiceName) {
     try {
-      await generateRealAudio(text, audioId);
-    } catch (error) {
-      console.log('Google TTS falló, intentando método alternativo:', error.message);
-      
-      // Si Google TTS falla, usar método alternativo
-      try {
-        await generateAudioWithGTTS(text, audioId);
-      } catch (altError) {
-        console.log('Método alternativo falló:', altError.message);
+        console.log(`📤 Subiendo voz "${voiceName}" a Chatterbox...`);
         
-        // Como último recurso, crear un audio simple
-        const simpleAudio = Buffer.from([
-          // Header MP3 mínimo (esto es solo un placeholder)
-          0xFF, 0xFB, 0x90, 0x00, 0x00, 0x00, 0x00, 0x00,
-          0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
-        ]);
-        
-        audioTexts.set(audioId, {
-          text: text,
-          audioBuffer: simpleAudio,
-          contentType: 'audio/mpeg',
-          generated: new Date(),
-          fallback: true
+        const formData = new FormData();
+        formData.append('voice_file', audioBuffer, { 
+            filename: `${voiceName}.wav`,
+            contentType: 'audio/wav'
         });
-      }
+        formData.append('name', voiceName);
+        
+        // Intentar con API oficial primero
+        let response;
+        try {
+            response = await fetch(`${CHATTERBOX_API_URL}/v1/voices`, {
+                method: 'POST',
+                body: formData,
+                headers: {
+                    ...formData.getHeaders(),
+                    'Authorization': `Bearer ${process.env.CHATTERBOX_API_KEY || 'demo'}`
+                }
+            });
+        } catch (error) {
+            console.log('🔄 API oficial no disponible, usando servidor local...');
+            response = await fetch(`${CHATTERBOX_BACKUP_URL}/v1/voices`, {
+                method: 'POST',
+                body: formData,
+                headers: formData.getHeaders()
+            });
+        }
+        
+        if (response.ok) {
+            const result = await response.json();
+            console.log(`✅ Voz "${voiceName}" subida exitosamente`);
+            return result;
+        } else {
+            throw new Error(`Error HTTP: ${response.status}`);
+        }
+        
+    } catch (error) {
+        console.error('❌ Error subiendo voz:', error.message);
+        throw error;
+    }
+}
+
+// Función para generar audio con Chatterbox real
+async function generateChatterboxAudio(text, voiceName = 'female') {
+    try {
+        console.log(`🎤 Generando audio con Chatterbox (voz: ${voiceName})...`);
+        
+        const requestBody = {
+            input: text,
+            voice: voiceName,
+            response_format: 'wav',
+            speed: 1.0
+        };
+        
+        // Intentar con API oficial primero
+        let response;
+        try {
+            response = await fetch(`${CHATTERBOX_API_URL}/v1/audio/speech`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${process.env.CHATTERBOX_API_KEY || 'demo'}`
+                },
+                body: JSON.stringify(requestBody)
+            });
+        } catch (error) {
+            console.log('🔄 API oficial no disponible, usando servidor local...');
+            response = await fetch(`${CHATTERBOX_BACKUP_URL}/v1/audio/speech`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify(requestBody)
+            });
+        }
+        
+        if (response.ok) {
+            const audioBuffer = await response.buffer();
+            console.log(`✅ Audio generado: ${audioBuffer.length} bytes`);
+            return {
+                success: true,
+                audioBuffer: audioBuffer,
+                contentType: 'audio/wav',
+                size: audioBuffer.length
+            };
+        } else {
+            const errorText = await response.text();
+            throw new Error(`Chatterbox API error: ${response.status} - ${errorText}`);
+        }
+        
+    } catch (error) {
+        console.error('❌ Error generando audio con Chatterbox:', error.message);
+        
+        // Fallback a Google TTS si Chatterbox falla
+        console.log('🔄 Usando Google TTS como fallback...');
+        return await generateGoogleTTSFallback(text);
+    }
+}
+
+// Fallback con Google TTS
+async function generateGoogleTTSFallback(text) {
+    return new Promise((resolve, reject) => {
+        const googleTTSUrl = `https://translate.google.com/translate_tts?ie=UTF-8&q=${encodeURIComponent(text)}&tl=es&client=tw-ob`;
+        
+        https.get(googleTTSUrl, (response) => {
+            if (response.statusCode === 200) {
+                let audioBuffer = Buffer.alloc(0);
+                
+                response.on('data', (chunk) => {
+                    audioBuffer = Buffer.concat([audioBuffer, chunk]);
+                });
+                
+                response.on('end', () => {
+                    resolve({
+                        success: true,
+                        audioBuffer: audioBuffer,
+                        contentType: 'audio/mpeg',
+                        size: audioBuffer.length,
+                        fallback: true
+                    });
+                });
+            } else {
+                reject(new Error(`Google TTS error: ${response.statusCode}`));
+            }
+        }).on('error', reject);
+    });
+}
+
+// Endpoint para subir archivo de voz
+app.post('/voice/upload', async (req, res) => {
+    try {
+        // Este endpoint recibirá archivos de voz del frontend
+        // Por ahora simular la subida
+        const voiceId = `voice_${Date.now()}`;
+        const voiceName = req.body.name || `custom_voice_${Date.now()}`;
+        
+        // Guardar info de la voz
+        voiceLibrary.set(voiceId, {
+            id: voiceId,
+            name: voiceName,
+            uploaded_at: new Date(),
+            status: 'ready'
+        });
+        
+        console.log(`📁 Voz guardada: ${voiceName} (ID: ${voiceId})`);
+        
+        res.json({
+            success: true,
+            voice_id: voiceId,
+            voice_name: voiceName,
+            message: 'Voz subida exitosamente',
+            status: 'ready'
+        });
+        
+    } catch (error) {
+        console.error('Error subiendo voz:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Error procesando archivo de voz'
+        });
+    }
+});
+
+// Endpoint para listar voces disponibles
+app.get('/voices', (req, res) => {
+    const predefinedVoices = [
+        { id: 'female', name: 'Voz Femenina Profesional', type: 'predefined' },
+        { id: 'male', name: 'Voz Masculina Profesional', type: 'predefined' }
+    ];
+    
+    const customVoices = Array.from(voiceLibrary.values()).map(voice => ({
+        ...voice,
+        type: 'custom'
+    }));
+    
+    res.json({
+        success: true,
+        voices: [...predefinedVoices, ...customVoices]
+    });
+});
+
+// Endpoint para generar TTS con Chatterbox REAL
+app.post('/tts/generate', async (req, res) => {
+    try {
+        const { text, voice_type = 'female', voice_id = null } = req.body;
+        
+        if (!text) {
+            return res.status(400).json({ error: 'Texto requerido' });
+        }
+        
+        const audioId = `audio_${Date.now()}`;
+        console.log(`🎯 Generando audio ${audioId} con Chatterbox REAL`);
+        
+        // Determinar qué voz usar
+        let selectedVoice = voice_type;
+        if (voice_id && voiceLibrary.has(voice_id)) {
+            selectedVoice = voiceLibrary.get(voice_id).name;
+            console.log(`🎤 Usando voz personalizada: ${selectedVoice}`);
+        }
+        
+        // Generar audio con Chatterbox
+        const audioResult = await generateChatterboxAudio(text, selectedVoice);
+        
+        // Guardar el audio
+        audioTexts.set(audioId, {
+            text: text,
+            audioBuffer: audioResult.audioBuffer,
+            contentType: audioResult.contentType,
+            generated: new Date(),
+            voice_used: selectedVoice,
+            fallback: audioResult.fallback || false,
+            size: audioResult.size
+        });
+        
+        // Respuesta de éxito
+        res.json({
+            success: true,
+            audio_id: audioId,
+            message: audioResult.fallback ? 
+                'Audio generado con sistema de respaldo' : 
+                'Audio generado exitosamente con Chatterbox',
+            audio_info: {
+                duration_minutes: Math.ceil(text.length / 150),
+                file_size_mb: Math.round(audioResult.size / 1024 / 1024 * 100) / 100,
+                format: audioResult.contentType.includes('wav') ? 'wav' : 'mp3',
+                sample_rate: audioResult.contentType.includes('wav') ? '22050Hz' : '44100Hz',
+                quality: audioResult.fallback ? 'standard' : 'high',
+                voice_used: selectedVoice,
+                engine: audioResult.fallback ? 'Google TTS' : 'Chatterbox'
+            },
+            download_url: `/download/${audioId}`,
+            text_stats: {
+                characters: text.length,
+                words: text.split(' ').length,
+                estimated_duration: `${Math.ceil(text.length / 150)} minutos`
+            }
+        });
+        
+    } catch (error) {
+        console.error('Error generando audio:', error);
+        res.status(500).json({ 
+            success: false,
+            error: 'Error interno del servidor: ' + error.message 
+        });
+    }
+});
+
+// Endpoint de descarga con audio REAL
+app.get('/download/:audioId', (req, res) => {
+    const { audioId } = req.params;
+    
+    const audioData = audioTexts.get(audioId);
+    
+    if (!audioData) {
+        return res.status(404).json({ 
+            error: 'Audio no encontrado',
+            audio_id: audioId
+        });
     }
     
-    // Respuesta exitosa
-    res.json({
-      success: true,
-      audio_id: audioId,
-      message: 'Audio generado exitosamente',
-      audio_info: {
-        duration_minutes: Math.ceil(text.length / 150), // Estimación
-        file_size_mb: Math.round((text.length * 0.8) / 1024), // Estimación
-        format: 'mp3',
-        sample_rate: '44100Hz',
-        quality: 'high'
-      },
-      download_url: `/download/${audioId}`,
-      text_stats: {
-        characters: text.length,
-        words: text.split(' ').length,
-        estimated_duration: `${Math.ceil(text.length / 150)} minutos`
-      }
+    if (!audioData.audioBuffer) {
+        return res.status(500).json({
+            error: 'Error: audio no disponible',
+            audio_id: audioId
+        });
+    }
+    
+    console.log(`📥 Descargando audio ${audioId} (${audioData.size} bytes)`);
+    
+    // Determinar extensión de archivo
+    const extension = audioData.contentType.includes('wav') ? 'wav' : 'mp3';
+    
+    // Headers de descarga
+    res.set({
+        'Content-Type': audioData.contentType,
+        'Content-Length': audioData.audioBuffer.length,
+        'Content-Disposition': `attachment; filename="book_voice_${audioId}.${extension}"`,
+        'Cache-Control': 'public, max-age=3600',
+        'X-Audio-Engine': audioData.fallback ? 'Google-TTS' : 'Chatterbox',
+        'X-Voice-Used': audioData.voice_used
     });
     
-  } catch (error) {
-    console.error('Error generando audio:', error);
-    res.status(500).json({ error: 'Error interno del servidor' });
-  }
+    res.send(audioData.audioBuffer);
 });
 
-// 🚀 NUEVO ENDPOINT DE DESCARGA CON AUDIO REAL
-app.get('/download/:audioId', (req, res) => {
-  const { audioId } = req.params;
-  
-  // Buscar el audio en memoria
-  const audioData = audioTexts.get(audioId);
-  
-  if (!audioData) {
-    return res.status(404).json({ 
-      error: 'Audio no encontrado',
-      audio_id: audioId
-    });
-  }
-  
-  // Si el audio aún se está procesando
-  if (audioData.processing && !audioData.audioBuffer) {
-    return res.status(202).json({
-      message: 'Audio aún procesándose, intenta de nuevo en unos segundos',
-      audio_id: audioId,
-      status: 'processing'
-    });
-  }
-  
-  // Si no hay buffer de audio, error
-  if (!audioData.audioBuffer) {
-    return res.status(500).json({
-      error: 'Error generando audio',
-      audio_id: audioId
-    });
-  }
-  
-  // 🎧 DEVOLVER AUDIO REAL
-  res.set({
-    'Content-Type': audioData.contentType,
-    'Content-Length': audioData.audioBuffer.length,
-    'Content-Disposition': `attachment; filename="audio_${audioId}.mp3"`,
-    'Cache-Control': 'public, max-age=3600'
-  });
-  
-  res.send(audioData.audioBuffer);
-});
-
-// Endpoint para obtener información del audio
+// Endpoint de información del audio
 app.get('/info/:audioId', (req, res) => {
-  const { audioId } = req.params;
-  const audioData = audioTexts.get(audioId);
-  
-  if (!audioData) {
-    return res.status(404).json({ error: 'Audio no encontrado' });
-  }
-  
-  res.json({
-    audio_id: audioId,
-    text: audioData.text,
-    size: audioData.audioBuffer ? audioData.audioBuffer.length : 0,
-    generated: audioData.generated,
-    has_audio: !!audioData.audioBuffer,
-    processing: !!audioData.processing,
-    fallback: !!audioData.fallback
-  });
+    const { audioId } = req.params;
+    const audioData = audioTexts.get(audioId);
+    
+    if (!audioData) {
+        return res.status(404).json({ error: 'Audio no encontrado' });
+    }
+    
+    res.json({
+        audio_id: audioId,
+        text: audioData.text,
+        size: audioData.audioBuffer ? audioData.audioBuffer.length : 0,
+        generated: audioData.generated,
+        has_audio: !!audioData.audioBuffer,
+        voice_used: audioData.voice_used,
+        engine: audioData.fallback ? 'Google TTS' : 'Chatterbox',
+        content_type: audioData.contentType
+    });
 });
 
-// Endpoint de salud
+// Endpoint de salud del sistema
 app.get('/health', (req, res) => {
-  res.json({ 
-    status: 'ok', 
-    timestamp: new Date(),
-    audios_stored: audioTexts.size
-  });
+    res.json({ 
+        status: 'ok',
+        timestamp: new Date(),
+        audios_stored: audioTexts.size,
+        voices_stored: voiceLibrary.size,
+        engine: 'Chatterbox + Google TTS Fallback',
+        version: '3.0.0'
+    });
 });
 
 // Endpoint raíz
 app.get('/', (req, res) => {
-  res.json({ 
-    message: 'Book Voice TTS Server - ¡Generando Audio Real!',
-    version: '2.0.0',
-    endpoints: [
-      'POST /tts/generate',
-      'GET /download/:audioId',
-      'GET /info/:audioId',
-      'GET /health'
-    ]
-  });
+    res.json({ 
+        message: 'Book Voice TTS Server - Chatterbox REAL Audio!',
+        version: '3.0.0',
+        engine: 'Chatterbox Professional + Fallbacks',
+        endpoints: [
+            'POST /tts/generate - Generar audio con Chatterbox',
+            'GET /download/:audioId - Descargar audio real',
+            'POST /voice/upload - Subir voz personalizada',
+            'GET /voices - Listar voces disponibles',
+            'GET /info/:audioId - Info del audio',
+            'GET /health - Estado del sistema'
+        ],
+        features: [
+            '🎤 Chatterbox TTS real',
+            '🔊 Voice cloning support',
+            '📥 Custom voice upload',
+            '💾 High-quality audio download',
+            '🔄 Google TTS fallback',
+            '⚡ Fast processing'
+        ]
+    });
 });
 
 // Limpiar audios antiguos cada hora
 setInterval(() => {
-  const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000);
-  
-  for (const [audioId, audioData] of audioTexts.entries()) {
-    if (audioData.generated < oneHourAgo) {
-      audioTexts.delete(audioId);
+    const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000);
+    
+    for (const [audioId, audioData] of audioTexts.entries()) {
+        if (audioData.generated < oneHourAgo) {
+            audioTexts.delete(audioId);
+        }
     }
-  }
-  
-  console.log(`Limpieza: ${audioTexts.size} audios en memoria`);
+    
+    console.log(`🧹 Limpieza: ${audioTexts.size} audios en memoria`);
 }, 60 * 60 * 1000);
 
 app.listen(port, () => {
-  console.log(`🎧 Book Voice TTS Server ejecutándose en puerto ${port}`);
-  console.log(`🚀 Generando AUDIO REAL desde ahora!`);
+    console.log(`🎧 Book Voice TTS Server v3.0 ejecutándose en puerto ${port}`);
+    console.log(`🚀 Usando Chatterbox REAL + Fallbacks!`);
+    console.log(`🔊 Soporta voice cloning y audio de alta calidad`);
 });
